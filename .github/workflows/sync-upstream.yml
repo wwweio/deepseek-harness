@@ -1,0 +1,150 @@
+name: Sync upstream
+
+# Fork-only maintenance workflow: merges deepseek-ai/deepseek-harness into this
+# fork's master and mirrors its tag namespace on a daily schedule. GitHub
+# disables scheduled workflows in a freshly created fork, so enable this one in
+# the Actions tab (or with `gh workflow enable sync-upstream.yml`);
+# workflow_dispatch syncs immediately.
+on:
+  schedule:
+    # 03:17 UTC daily = 11:17 Asia/Shanghai — off the top-of-hour cron stampede.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-master
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync upstream master and tags
+    # The repository guard keeps this workflow inert if the file ever reaches
+    # upstream or another fork: neither may have its master rewritten, nor its
+    # workflows disabled by the first step.
+    if: github.repository == 'wwweio/deepseek-harness'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Quiet every workflow except this one
+        # This fork wants only the sync workflow. The inherited ones are the
+        # upstream project's own CI and release pipelines, which need its
+        # self-hosted runners and secrets, and Dependabot pull requests against
+        # inherited lockfiles would conflict with the daily sync. Enabling
+        # Actions on a fork registers every inherited workflow at once, and a
+        # sync can add another workflow file at any time, so each run re-checks
+        # the list instead of disabling a fixed set. The step runs first, and a
+        # settings failure must not cost the day's code sync, hence
+        # continue-on-error: the run still carries the failure annotation.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: ${{ github.workflow }}
+        run: |
+          set -euo pipefail
+          # An empty name would match no workflow and disable this one too.
+          if [ -z "$KEEP" ]; then
+            echo '::error::github.workflow resolved empty; refusing to change workflow states.'
+            exit 1
+          fi
+          active=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows?per_page=100" \
+            --jq '.workflows[] | select(.state == "active") | "\(.id)\t\(.name)\t\(.path)"')
+          # This workflow is itself active, so an empty list means the listing
+          # call returned nothing rather than that the fork is already quiet.
+          if [ -z "$active" ]; then
+            echo 'the workflow listing came back empty; nothing to quiet.'
+            exit 0
+          fi
+          # Workflow names contain spaces, so the projection is tab separated.
+          while IFS=$'\t' read -r id name path; do
+            if [ "$name" = "$KEEP" ]; then
+              echo "keeping $path"
+              continue
+            fi
+            echo "disabling $path"
+            gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$id/disable"
+          done <<< "$active"
+
+      - name: Check out master
+        uses: actions/checkout@v6
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Fetch upstream master and tags
+        run: |
+          git remote add upstream https://github.com/deepseek-ai/deepseek-harness.git
+          git fetch --tags --force upstream master
+
+      - name: Sync upstream tags
+        # Tag mirroring runs before the branch merge so a master conflict still
+        # leaves the fork's tags current. Release tags are authored upstream and
+        # this fork never creates its own, so updating the tag namespace in
+        # place cannot discard fork work; the branch push below never forces.
+        run: |
+          set -euo pipefail
+          if [ -z "$(git tag --list)" ]; then
+            echo 'upstream published no tags; nothing to sync.'
+            exit 0
+          fi
+          # The push output is the report: it names every tag it created or
+          # moved, and reads 'Everything up-to-date' when origin already carried
+          # each upstream tag at the same commit.
+          pushed=$(git push --force origin 'refs/tags/*:refs/tags/*' 2>&1)
+          printf '%s\n' "$pushed"
+          case $pushed in
+            *'Everything up-to-date'*) ;;
+            *)
+              {
+                echo '## Synced upstream tags'
+                echo
+                printf '%s\n' "$pushed"
+              } >> "$GITHUB_STEP_SUMMARY"
+              ;;
+          esac
+
+      - name: Merge upstream master
+        id: merge
+        run: |
+          set -euo pipefail
+          before=$(git rev-parse HEAD)
+          upstream_head=$(git rev-parse --short upstream/master)
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "master already contains upstream/master ($upstream_head); nothing to sync."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Fast-forward while master carries no fork-local commits. Once this
+          # workflow file sits on master the fast-forward is impossible, and the
+          # merge commit is what keeps fork-local changes instead of dropping
+          # them; neither path ever rewrites published history.
+          if git merge --ff-only upstream/master; then
+            echo "Fast-forwarded master to upstream/master ($upstream_head)."
+          elif ! git merge --no-edit upstream/master; then
+            conflicts=$(git diff --name-only --diff-filter=U)
+            git merge --abort
+            echo "::error::master conflicts with upstream/master ($upstream_head); resolve locally, push, then re-run this workflow."
+            echo 'Conflicting paths:'
+            printf '%s\n' "$conflicts"
+            exit 1
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Synced master to upstream/master ($upstream_head)"
+            echo
+            git log --oneline --no-decorate "$before..HEAD"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push master
+        if: steps.merge.outputs.changed == 'true'
+        # The push authenticates with this workflow's GITHUB_TOKEN, and GitHub
+        # starts no workflow run for a GITHUB_TOKEN push. That is what keeps the
+        # inherited upstream CI (ci-master, release, sandbox, landlock-run, e2e)
+        # out of this fork: those jobs need upstream's self-hosted runners and
+        # secrets, which a fork does not have.
+        run: git push origin HEAD:master
